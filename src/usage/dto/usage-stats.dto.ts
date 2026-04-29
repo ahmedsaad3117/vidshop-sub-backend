@@ -1,5 +1,9 @@
 export class UsageStatsDto {
   currentPeriod!: {
+    tokenBalance: number;
+    tokenAllocation: number;
+    tokensUsed: number;
+    tokenPercentUsed: number;
     videosGenerated: number;
     videosLimit: number;
     videosRemaining: number;

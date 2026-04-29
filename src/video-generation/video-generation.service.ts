@@ -1,10 +1,12 @@
 import {
   BadRequestException,
+  InternalServerErrorException,
   ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import {
@@ -20,12 +22,13 @@ import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import { GenerateVideoDto } from './dto/generate-video.dto';
 import { VideoListQueryDto } from './dto/video-list-query.dto';
 import { WpVideoRequestDto } from './dto/wp-video-request.dto';
-import { ExternalVideoApiService } from './external-video-api.service';
 import { TokenService } from './token.service';
+import { VideoProviderService } from './video-provider.service';
 
 @Injectable()
 export class VideoGenerationService {
   private readonly logger = new Logger(VideoGenerationService.name);
+  private readonly tokenCostFallback: number;
 
   constructor(
     @InjectRepository(VideoGeneration)
@@ -34,13 +37,26 @@ export class VideoGenerationService {
     private readonly subscriptionsRepository: Repository<Subscription>,
     @InjectRepository(UsageRecord)
     private readonly usageRepository: Repository<UsageRecord>,
+    private readonly configService: ConfigService,
     private readonly promptsService: PromptsService,
     private readonly subscriptionsService: SubscriptionsService,
-    private readonly externalVideoApiService: ExternalVideoApiService,
+    private readonly videoProviderService: VideoProviderService,
     private readonly tokenService: TokenService,
-  ) {}
+  ) {
+    this.tokenCostFallback = Number(
+      this.configService.get<string>('VIDEO_TOKEN_COST_FALLBACK', '1000'),
+    );
 
-  async generateVideo(userId: string, dto: GenerateVideoDto): Promise<VideoGeneration> {
+    if (!Number.isFinite(this.tokenCostFallback) || this.tokenCostFallback <= 0) {
+      throw new InternalServerErrorException('VIDEO_TOKEN_COST_FALLBACK must be a positive number');
+    }
+  }
+
+  async generateVideo(
+    userId: string,
+    dto: GenerateVideoDto,
+    promptImageOverride?: string,
+  ): Promise<VideoGeneration> {
     this.logger.log(`Starting video generation for user ${userId} and product '${dto.productTitle}'`);
 
     if (!dto.templateId && !dto.customPrompt) {
@@ -67,10 +83,6 @@ export class VideoGenerationService {
       throw new ForbiddenException('Monthly video generation limit reached');
     }
 
-    if (dto.customPrompt && !subscription.tier.hasCustomPrompts) {
-      throw new ForbiddenException('Custom prompts are not available on your current plan');
-    }
-
     if (dto.templateId) {
       const template = await this.promptsService.getTemplateById(dto.templateId, userId);
       if (template.tier === PromptTier.PREMIUM && subscription.tier.name === 'free') {
@@ -87,10 +99,9 @@ export class VideoGenerationService {
 
     // Check token balance before proceeding
     const currentBalance = await this.tokenService.getBalance(userId);
-    const estimatedTokens = 1000; // Estimated tokens per video (adjust based on your system)
-    if (currentBalance < estimatedTokens) {
+    if (currentBalance !== -1 && currentBalance < this.tokenCostFallback) {
       throw new ForbiddenException(
-        `Insufficient tokens. Required: ~${estimatedTokens}, Available: ${currentBalance}`,
+        `Insufficient tokens. Required: ~${this.tokenCostFallback}, Available: ${currentBalance}`,
       );
     }
 
@@ -105,6 +116,7 @@ export class VideoGenerationService {
       customPrompt: dto.customPrompt ?? null,
       status: VideoStatus.PENDING,
       videoUrl: null,
+      providerTaskId: null,
       tokensUsed: null,
       errorMessage: null,
       processingStartedAt: null,
@@ -113,37 +125,26 @@ export class VideoGenerationService {
 
     record = await this.videoRepository.save(record);
 
-    record.status = VideoStatus.PROCESSING;
-    record.processingStartedAt = new Date();
-    record = await this.videoRepository.save(record);
-
+    // Create video task asynchronously (non-blocking)
     try {
-      // Generate lora string from product image URL (or use default)
-      const lora = this.extractLoraFromImage(dto.productImageUrl);
+      const taskResult = await this.videoProviderService.createVideoTask({
+        promptText: resolvedPrompt,
+        promptImage: promptImageOverride ?? dto.productImageUrl!,
+      });
 
-      const result = await this.externalVideoApiService.generateVideo(
-        resolvedPrompt,
-        lora,
-      );
-
-      // Deduct tokens from user balance
-      await this.tokenService.deductTokens(userId, result.usedTokens, record.id);
-
-      record.status = VideoStatus.COMPLETED;
-      record.videoUrl = result.videoUrl;
-      record.tokensUsed = result.usedTokens;
-      record.completedAt = new Date();
-      record.errorMessage = null;
+      // Update record with task ID and processing status
+      record.status = VideoStatus.PROCESSING;
+      record.providerTaskId = taskResult.taskId;
+      record.processingStartedAt = new Date();
       record = await this.videoRepository.save(record);
 
-      usageRecord.videosGenerated += 1;
-      await this.usageRepository.save(usageRecord);
-
-      this.logger.log(`Video generated successfully: ${record.id}`);
+      this.logger.log(`Video task created: ${record.id}, Runway task: ${taskResult.taskId}`);
+      
+      // Return immediately - polling service will update when complete
       return record;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown generation error';
-      this.logger.error(`Video generation failed for ${record.id}: ${message}`);
+      const message = error instanceof Error ? error.message : 'Failed to create video task';
+      this.logger.error(`Video task creation failed for ${record.id}: ${message}`);
 
       record.status = VideoStatus.FAILED;
       record.errorMessage = message;
@@ -197,9 +198,13 @@ export class VideoGenerationService {
   /**
    * Generate video from WordPress plugin request
    * Handles WP plugin format {title, description, image, category}
-   * and transforms to n8n format {prompt, lora}
+    * and transforms it into the internal provider generation payload
    */
-  async generateFromWpPlugin(userId: string, dto: WpVideoRequestDto): Promise<VideoGeneration> {
+  async generateFromWpPlugin(
+    userId: string,
+    dto: WpVideoRequestDto,
+    promptImageOverride?: string,
+  ): Promise<VideoGeneration> {
     this.logger.log(
       `Starting WP plugin video generation for user ${userId} and title '${dto.title}'`,
     );
@@ -222,10 +227,9 @@ export class VideoGenerationService {
 
     // Check token balance
     const currentBalance = await this.tokenService.getBalance(userId);
-    const estimatedTokens = 1000; // Estimated tokens per 8-second video
-    if (currentBalance < estimatedTokens) {
+    if (currentBalance !== -1 && currentBalance < this.tokenCostFallback) {
       throw new ForbiddenException(
-        `Insufficient tokens. Required: ~${estimatedTokens}, Available: ${currentBalance}`,
+        `Insufficient tokens. Required: ~${this.tokenCostFallback}, Available: ${currentBalance}`,
       );
     }
 
@@ -235,8 +239,6 @@ export class VideoGenerationService {
       dto.description,
       dto.category,
     );
-
-    const lora = this.extractLoraFromImage(dto.image);
 
     let record = this.videoRepository.create({
       userId,
@@ -249,6 +251,7 @@ export class VideoGenerationService {
       customPrompt: null,
       status: VideoStatus.PENDING,
       videoUrl: null,
+      providerTaskId: null,
       tokensUsed: null,
       errorMessage: null,
       processingStartedAt: null,
@@ -257,36 +260,28 @@ export class VideoGenerationService {
 
     record = await this.videoRepository.save(record);
 
-    record.status = VideoStatus.PROCESSING;
-    record.processingStartedAt = new Date();
-    record = await this.videoRepository.save(record);
-
+    // Create video task asynchronously (non-blocking)
     try {
-      const result = await this.externalVideoApiService.generateVideo(
-        generatedPrompt,
-        lora,
-      );
+      const taskResult = await this.videoProviderService.createVideoTask({
+        promptText: generatedPrompt,
+        promptImage: promptImageOverride ?? dto.image!,
+      });
 
-      // Deduct tokens from user balance
-      await this.tokenService.deductTokens(userId, result.usedTokens, record.id);
-
-      record.status = VideoStatus.COMPLETED;
-      record.videoUrl = result.videoUrl;
-      record.tokensUsed = result.usedTokens;
-      record.completedAt = new Date();
-      record.errorMessage = null;
+      // Update record with task ID and processing status
+      record.status = VideoStatus.PROCESSING;
+      record.providerTaskId = taskResult.taskId;
+      record.processingStartedAt = new Date();
       record = await this.videoRepository.save(record);
 
-      usageRecord.videosGenerated += 1;
-      await this.usageRepository.save(usageRecord);
-
       this.logger.log(
-        `WP plugin video generated successfully: ${record.id}, tokens used: ${result.usedTokens}`,
+        `WP plugin video task created: ${record.id}, Runway task: ${taskResult.taskId}`,
       );
+
+      // Return immediately - polling service will update when complete
       return record;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown generation error';
-      this.logger.error(`WP plugin video generation failed for ${record.id}: ${message}`);
+      const message = error instanceof Error ? error.message : 'Failed to create video task';
+      this.logger.error(`WP plugin video task creation failed for ${record.id}: ${message}`);
 
       record.status = VideoStatus.FAILED;
       record.errorMessage = message;
@@ -318,15 +313,5 @@ export class VideoGenerationService {
       categoryPrompts[categoryLower] ||
       `Create a professional video about "${title}". ${description}. Make it engaging and visually appealing.`
     );
-  }
-
-  /**
-   * Extract lora identifier from image URL or use default
-   */
-  private extractLoraFromImage(imageUrl: string): string {
-    // Logic to extract lora from image URL or metadata
-    // For now, return default lora string
-    // Can be enhanced to analyze image URL patterns or fetch image metadata
-    return 'default_lora_v1';
   }
 }

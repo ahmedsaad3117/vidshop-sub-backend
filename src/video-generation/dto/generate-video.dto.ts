@@ -20,8 +20,9 @@ export class GenerateVideoDto {
   @MaxLength(2000)
   productDescription!: string;
 
+  @IsOptional()
   @IsUrl()
-  productImageUrl!: string;
+  productImageUrl?: string;
 
   @ValidateIf((obj: GenerateVideoDto) => !obj.customPrompt)
   @IsUUID()

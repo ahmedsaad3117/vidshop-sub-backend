@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { CreditsModule } from '../credits/credits.module';
 import {
   Subscription,
   SubscriptionTier,
@@ -12,7 +13,7 @@ import { SubscriptionsService } from './subscriptions.service';
 import { TiersService } from './tiers.service';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([SubscriptionTier, Subscription, UsageRecord, User])],
+  imports: [CreditsModule, TypeOrmModule.forFeature([SubscriptionTier, Subscription, UsageRecord, User])],
   controllers: [TiersController, SubscriptionsController],
   providers: [TiersService, SubscriptionsService],
   exports: [TiersService, SubscriptionsService],

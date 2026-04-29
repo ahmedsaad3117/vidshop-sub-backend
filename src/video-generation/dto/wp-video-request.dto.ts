@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString, IsUrl, MaxLength } from 'class-validator';
+import { IsNotEmpty, IsOptional, IsString, IsUrl, MaxLength } from 'class-validator';
 
 export class WpVideoRequestDto {
   @IsString()
@@ -11,8 +11,9 @@ export class WpVideoRequestDto {
   @MaxLength(2000)
   description!: string;
 
+  @IsOptional()
   @IsUrl()
-  image!: string;
+  image?: string;
 
   @IsString()
   @IsNotEmpty()

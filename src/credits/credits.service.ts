@@ -73,7 +73,7 @@ export class CreditsService {
 
       const balanceBefore = user.tokenBalance;
       const creditsToAdd = pkg.totalCredits;
-      const balanceAfter = balanceBefore + creditsToAdd;
+      const balanceAfter = balanceBefore === -1 ? -1 : balanceBefore + creditsToAdd;
 
       // Update user balance
       user.tokenBalance = balanceAfter;
@@ -117,12 +117,12 @@ export class CreditsService {
         throw new NotFoundException('User not found');
       }
 
-      if (user.tokenBalance < amount) {
+      if (user.tokenBalance !== -1 && user.tokenBalance < amount) {
         throw new BadRequestException('Insufficient credits');
       }
 
       const balanceBefore = user.tokenBalance;
-      const balanceAfter = balanceBefore - amount;
+      const balanceAfter = balanceBefore === -1 ? -1 : balanceBefore - amount;
 
       user.tokenBalance = balanceAfter;
       await manager.save(user);
@@ -156,7 +156,7 @@ export class CreditsService {
       }
 
       const balanceBefore = user.tokenBalance;
-      const balanceAfter = balanceBefore + amount;
+      const balanceAfter = balanceBefore === -1 ? -1 : balanceBefore + amount;
 
       user.tokenBalance = balanceAfter;
       await manager.save(user);

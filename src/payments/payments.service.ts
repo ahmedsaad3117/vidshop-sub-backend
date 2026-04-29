@@ -101,6 +101,12 @@ export class PaymentsService {
       order: { createdAt: 'DESC' },
     });
 
+    const shouldGrantTokens =
+      !subscription ||
+      subscription.tierId !== tier.id ||
+      subscription.freemiusLicenseId !== license.id ||
+      subscription.currentPeriodEnd.getTime() < end.getTime();
+
     if (!subscription) {
       subscription = this.subscriptionsRepository.create({
         userId,
@@ -126,6 +132,13 @@ export class PaymentsService {
 
     const saved = await this.subscriptionsRepository.save(subscription);
     await this.resetUsageForPeriod(userId, start, end, tier.videosPerMonth);
+    if (shouldGrantTokens) {
+      await this.applySubscriptionTokenAllocation(
+        userId,
+        tier.tokenAllocation,
+        `Freemius subscription activation for ${tier.displayName}`,
+      );
+    }
     this.logger.log(`License activated for user ${userId} on tier ${tier.name}`);
 
     return this.subscriptionsRepository.findOneOrFail({
@@ -167,6 +180,12 @@ export class PaymentsService {
       order: { createdAt: 'DESC' },
     });
 
+    const shouldGrantTokens =
+      !subscription ||
+      subscription.tierId !== tier.id ||
+      subscription.freemiusLicenseId !== license.id ||
+      subscription.currentPeriodEnd.getTime() < expirationDate.getTime();
+
     if (!subscription) {
       subscription = this.subscriptionsRepository.create({
         userId,
@@ -194,6 +213,13 @@ export class PaymentsService {
 
     const saved = await this.subscriptionsRepository.save(subscription);
     await this.resetUsageForPeriod(userId, start, expirationDate, tier.videosPerMonth);
+    if (shouldGrantTokens) {
+      await this.applySubscriptionTokenAllocation(
+        userId,
+        tier.tokenAllocation,
+        `Freemius checkout activation for ${tier.displayName}`,
+      );
+    }
     this.logger.log(`Purchase activated for user ${userId} on tier ${tier.name} (license_id=${license.id})`);
 
     return this.subscriptionsRepository.findOneOrFail({
@@ -457,6 +483,27 @@ export class PaymentsService {
    */
   async getFreemiusSandboxParams(): Promise<any> {
     return this.freemiusService.getSandboxParams();
+  }
+
+  private async applySubscriptionTokenAllocation(
+    userId: string,
+    tokenAllocation: number,
+    reason: string,
+  ): Promise<void> {
+    if (tokenAllocation === -1) {
+      const user = await this.usersRepository.findOne({ where: { id: userId } });
+      if (!user) {
+        throw new NotFoundException('User not found');
+      }
+
+      user.tokenBalance = -1;
+      await this.usersRepository.save(user);
+      return;
+    }
+
+    if (tokenAllocation > 0) {
+      await this.creditsService.addBonusCredits(userId, tokenAllocation, reason);
+    }
   }
 }
 

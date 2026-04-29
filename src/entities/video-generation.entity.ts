@@ -50,6 +50,9 @@ export class VideoGeneration {
   @Column({ type: 'varchar', nullable: true })
   videoUrl!: string | null;
 
+  @Column({ type: 'varchar', nullable: true })
+  providerTaskId!: string | null;
+
   @Column({ type: 'int', nullable: true })
   tokensUsed!: number | null;
 

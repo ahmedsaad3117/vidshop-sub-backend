@@ -6,11 +6,13 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { FindOptionsWhere, MoreThan, Repository } from 'typeorm';
+import { CreditsService } from '../credits/credits.service';
 import {
   Subscription,
   SubscriptionStatus,
   SubscriptionTier,
   UsageRecord,
+  User,
 } from '../entities';
 import { ChangeSubscriptionDto } from './dto/change-subscription.dto';
 
@@ -25,23 +27,36 @@ export class SubscriptionsService {
     private readonly tiersRepository: Repository<SubscriptionTier>,
     @InjectRepository(UsageRecord)
     private readonly usageRecordsRepository: Repository<UsageRecord>,
+    @InjectRepository(User)
+    private readonly usersRepository: Repository<User>,
+    private readonly creditsService: CreditsService,
   ) {}
 
   async getUserSubscription(userId: string): Promise<{
     subscription: Subscription;
     tier: SubscriptionTier;
-    usage: UsageRecord | null;
+    usage: (UsageRecord & { tokenBalance: number; tokenAllocation: number }) | null;
   } | null> {
     const subscription = await this.findCurrentSubscription(userId);
     if (!subscription) {
       return null;
     }
 
-    const usage = await this.getCurrentUsage(userId);
+    const [usage, user] = await Promise.all([
+      this.getCurrentUsage(userId),
+      this.usersRepository.findOne({ where: { id: userId } }),
+    ]);
+
     return {
       subscription,
       tier: subscription.tier,
-      usage,
+      usage: usage && user
+        ? {
+            ...usage,
+            tokenBalance: user.tokenBalance,
+            tokenAllocation: subscription.tier.tokenAllocation,
+          }
+        : null,
     };
   }
 
@@ -84,6 +99,11 @@ export class SubscriptionsService {
       await this.subscriptionsRepository.save(subscription);
 
       await this.resetUsageForPeriod(userId, start, end, targetTier.videosPerMonth);
+      await this.applySubscriptionTokenAllocation(
+        userId,
+        targetTier.tokenAllocation,
+        `Subscription upgraded to ${targetTier.displayName}`,
+      );
 
       return this.findCurrentSubscriptionOrFail(userId);
     }
@@ -145,12 +165,20 @@ export class SubscriptionsService {
       await this.subscriptionsRepository.save(subscription);
 
       const freshSubscription = await this.findCurrentSubscriptionOrFail(userId);
-      return this.resetUsageForPeriod(
+      const usage = await this.resetUsageForPeriod(
         userId,
         start,
         end,
         freshSubscription.tier.videosPerMonth,
       );
+
+      await this.applySubscriptionTokenAllocation(
+        userId,
+        freshSubscription.tier.tokenAllocation,
+        `Monthly token allocation for ${freshSubscription.tier.displayName}`,
+      );
+
+      return usage;
     }
 
     const currentUsage = await this.getCurrentUsage(userId);
@@ -257,5 +285,26 @@ export class SubscriptionsService {
     }
 
     return saved;
+  }
+
+  private async applySubscriptionTokenAllocation(
+    userId: string,
+    tokenAllocation: number,
+    reason: string,
+  ): Promise<void> {
+    const user = await this.usersRepository.findOne({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (tokenAllocation === -1) {
+      user.tokenBalance = -1;
+      await this.usersRepository.save(user);
+      return;
+    }
+
+    if (tokenAllocation > 0) {
+      await this.creditsService.addBonusCredits(userId, tokenAllocation, reason);
+    }
   }
 }

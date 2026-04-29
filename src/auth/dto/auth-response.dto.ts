@@ -6,5 +6,8 @@ export class AuthResponseDto {
     firstName: string | null;
     lastName: string | null;
     companyName: string | null;
+    websiteUrl: string;
+    tokenBalance: number;
+    isAdmin: boolean;
   };
 }

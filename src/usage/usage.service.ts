@@ -12,11 +12,13 @@ import {
   SubscriptionStatus,
   SubscriptionTier,
   UsageRecord,
+  User,
   VideoGeneration,
   VideoStatus,
 } from '../entities';
 import { AdminUsageQueryDto } from './dto/admin-usage-query.dto';
 import { UsageStatsDto } from './dto/usage-stats.dto';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class UsageService {
@@ -29,13 +31,42 @@ export class UsageService {
     private readonly subscriptionsRepository: Repository<Subscription>,
     @InjectRepository(SubscriptionTier)
     private readonly tiersRepository: Repository<SubscriptionTier>,
+    @InjectRepository(User)
+    private readonly usersRepository: Repository<User>,
     @InjectRepository(VideoGeneration)
     private readonly videoRepository: Repository<VideoGeneration>,
+    private readonly configService: ConfigService,
   ) {}
 
   async getUserUsageStats(userId: string): Promise<UsageStatsDto> {
-    const subscription = await this.getActiveSubscription(userId);
-    const usage = await this.getOrCreateCurrentUsageRecord(userId);
+    const [subscription, usage, user] = await Promise.all([
+      this.getActiveSubscription(userId),
+      this.getOrCreateCurrentUsageRecord(userId),
+      this.usersRepository.findOne({ where: { id: userId } }),
+    ]);
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const tokensUsedRaw = await this.videoRepository
+      .createQueryBuilder('video')
+      .select('COALESCE(SUM(video.tokensUsed), 0)', 'tokensUsed')
+      .where('video.userId = :userId', { userId })
+      .andWhere('video.completedAt BETWEEN :start AND :end', {
+        start: usage.billingPeriodStart,
+        end: usage.billingPeriodEnd,
+      })
+      .andWhere('video.status = :status', { status: VideoStatus.COMPLETED })
+      .getRawOne<{ tokensUsed: string }>();
+
+    const tokensUsed = Number(tokensUsedRaw?.tokensUsed || 0);
+    const tokenAllocation = subscription.tier.tokenAllocation;
+    const tokenBalance = user.tokenBalance;
+    const tokenPercentUsed =
+      tokenAllocation <= 0 || tokenAllocation === -1
+        ? 0
+        : Math.min(100, Math.round((tokensUsed / tokenAllocation) * 100));
 
     const videosRemaining =
       usage.videosLimit === -1 ? -1 : Math.max(usage.videosLimit - usage.videosGenerated, 0);
@@ -69,6 +100,10 @@ export class UsageService {
 
     return {
       currentPeriod: {
+        tokenBalance,
+        tokenAllocation,
+        tokensUsed,
+        tokenPercentUsed,
         videosGenerated: usage.videosGenerated,
         videosLimit: usage.videosLimit,
         videosRemaining,
@@ -146,10 +181,17 @@ export class UsageService {
       return { allowed: false, reason: 'Subscription is not active' };
     }
 
-    const usage = await this.getOrCreateCurrentUsageRecord(userId);
+    const user = await this.usersRepository.findOne({ where: { id: userId } });
+    if (!user) {
+      return { allowed: false, reason: 'User not found' };
+    }
 
-    if (usage.videosLimit !== -1 && usage.videosGenerated >= usage.videosLimit) {
-      return { allowed: false, reason: 'Monthly video generation limit reached' };
+    const requiredTokens = Number(
+      this.configService.get<string>('VIDEO_TOKEN_COST_FALLBACK', '1000'),
+    );
+
+    if (user.tokenBalance !== -1 && user.tokenBalance < requiredTokens) {
+      return { allowed: false, reason: `Insufficient token balance. Required: ${requiredTokens}` };
     }
 
     return { allowed: true };
@@ -280,6 +322,8 @@ export class UsageService {
             videosLimit: refreshed.tier.videosPerMonth,
           }),
         );
+
+        await this.applyMonthlyTokenAllocation(refreshed.userId, refreshed.tier.tokenAllocation);
       }
 
       this.logger.log(`Reset billing cycle for subscription: ${subscription.id}`);
@@ -302,5 +346,20 @@ export class UsageService {
     }
 
     return subscription;
+  }
+
+  private async applyMonthlyTokenAllocation(userId: string, tokenAllocation: number): Promise<void> {
+    const user = await this.usersRepository.findOne({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (tokenAllocation === -1) {
+      user.tokenBalance = -1;
+    } else if (tokenAllocation > 0 && user.tokenBalance !== -1) {
+      user.tokenBalance += tokenAllocation;
+    }
+
+    await this.usersRepository.save(user);
   }
 }

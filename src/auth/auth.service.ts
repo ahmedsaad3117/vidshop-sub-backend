@@ -146,6 +146,9 @@ export class AuthService {
         firstName: user.firstName,
         lastName: user.lastName,
         companyName: user.companyName,
+        websiteUrl: user.websiteUrl,
+        tokenBalance: user.tokenBalance,
+        isAdmin: user.isAdmin,
       },
     };
   }

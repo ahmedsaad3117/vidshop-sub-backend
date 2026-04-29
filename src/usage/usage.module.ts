@@ -4,6 +4,7 @@ import {
   Subscription,
   SubscriptionTier,
   UsageRecord,
+  User,
   VideoGeneration,
 } from '../entities';
 import { UsageController } from './usage.controller';
@@ -15,6 +16,7 @@ import { UsageService } from './usage.service';
       UsageRecord,
       Subscription,
       SubscriptionTier,
+      User,
       VideoGeneration,
     ]),
   ],
